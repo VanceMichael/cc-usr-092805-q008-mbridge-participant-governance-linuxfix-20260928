@@ -12,6 +12,14 @@ from .jsonutil import canonical_json
 from .timeutil import Clock, canonical_instant, parse_instant
 
 
+def insert_job(connection, *, job_id: str, job_type: str, subject_id: str, run_at: str, payload: dict) -> None:
+    """在调用方已打开的事务连接上写入等待任务，保证与业务决定同提交。"""
+    connection.execute(
+        "INSERT INTO scheduled_jobs(job_id,job_type,subject_id,run_at,payload_json,status) VALUES(?,?,?,?,?,'waiting')",
+        (job_id, job_type, subject_id, run_at, canonical_json(payload)))
+
+
+
 @dataclass(frozen=True)
 class JobQueue:
     database: Database
@@ -20,15 +28,24 @@ class JobQueue:
     def schedule(self, *, job_type: str, subject_id: str, run_at: str, payload: dict) -> str:
         job_id = new_id("job"); run_at = canonical_instant(run_at)
         with self.database.transaction() as connection:
-            connection.execute("INSERT INTO scheduled_jobs(job_id,job_type,subject_id,run_at,payload_json,status) VALUES(?,?,?,?,?,'waiting')", (job_id, job_type, subject_id, run_at, canonical_json(payload)))
+            insert_job(connection, job_id=job_id, job_type=job_type, subject_id=subject_id,
+                       run_at=run_at, payload=payload)
         return job_id
 
-    def claim_due(self, *, seconds: int = 30, limit: int = 20) -> list[dict]:
+    def claim_due(self, *, seconds: int = 30, limit: int = 20, job_type: str | None = None,
+                  job_prefix: str | None = None) -> list[dict]:
         if seconds < 1 or limit < 1:
             raise ValidationError("租约参数不合法")
         lease_until = (parse_instant(self.clock.now()) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
         with self.database.transaction() as connection:
-            rows = connection.execute("SELECT * FROM scheduled_jobs WHERE run_at<=? AND status IN ('waiting','retry') AND (lease_until IS NULL OR lease_until<?) ORDER BY run_at,job_id LIMIT ?", (self.clock.now(), self.clock.now(), limit)).fetchall()
+            sql = "SELECT * FROM scheduled_jobs WHERE run_at<=? AND status IN ('waiting','retry') AND (lease_until IS NULL OR lease_until<?)"
+            params: list[object] = [self.clock.now(), self.clock.now()]
+            if job_type is not None:
+                sql += " AND job_type=?"; params.append(job_type)
+            if job_prefix is not None:
+                sql += " AND job_type LIKE ?"; params.append(job_prefix + "%")
+            sql += " ORDER BY run_at,job_id LIMIT ?"; params.append(limit)
+            rows = connection.execute(sql, params).fetchall()
             result = []
             for row in rows:
                 changed = connection.execute("UPDATE scheduled_jobs SET status='running',lease_until=?,attempt=attempt+1 WHERE job_id=? AND (lease_until IS NULL OR lease_until<?)", (lease_until, row["job_id"], self.clock.now())).rowcount
